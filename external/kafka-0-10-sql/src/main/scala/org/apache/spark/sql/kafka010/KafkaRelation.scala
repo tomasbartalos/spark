@@ -17,8 +17,10 @@
 
 package org.apache.spark.sql.kafka010
 
+import java.sql.Timestamp
 import java.util.UUID
 
+import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.TopicPartition
 
 import org.apache.spark.internal.Logging
@@ -26,8 +28,8 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Row, SQLContext}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
-import org.apache.spark.sql.sources.{BaseRelation, TableScan}
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.sources._
+import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
 
@@ -39,7 +41,7 @@ private[kafka010] class KafkaRelation(
     failOnDataLoss: Boolean,
     startingOffsets: KafkaOffsetRangeLimit,
     endingOffsets: KafkaOffsetRangeLimit)
-    extends BaseRelation with TableScan with Logging {
+    extends BaseRelation with PrunedFilteredScan with Logging {
   assert(startingOffsets != LatestOffsetRangeLimit,
     "Starting offset not allowed to be set to latest offsets.")
   assert(endingOffsets != EarliestOffsetRangeLimit,
@@ -54,7 +56,7 @@ private[kafka010] class KafkaRelation(
 
   override def schema: StructType = KafkaOffsetReader.kafkaSchema
 
-  override def buildScan(): RDD[Row] = {
+  def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row] = {
     // Each running query should use its own group id. Otherwise, the query may be only assigned
     // partial data since Kafka will assign partitions to multiple consumers having the same group
     // id. Hence, we should generate a unique id for each query.
@@ -69,8 +71,8 @@ private[kafka010] class KafkaRelation(
     // Leverage the KafkaReader to obtain the relevant partition offsets
     val (fromPartitionOffsets, untilPartitionOffsets) = {
       try {
-        (getPartitionOffsets(kafkaOffsetReader, startingOffsets),
-          getPartitionOffsets(kafkaOffsetReader, endingOffsets))
+        (getStartingPartitionOffsets(kafkaOffsetReader, filters),
+          getEndingPartitionOffsets(kafkaOffsetReader, filters))
       } finally {
         kafkaOffsetReader.close()
       }
@@ -94,7 +96,8 @@ private[kafka010] class KafkaRelation(
           // fromPartitionOffsets
           throw new IllegalStateException(s"$tp doesn't have a from offset")
       }
-      val untilOffset = untilPartitionOffsets(tp)
+      var untilOffset = untilPartitionOffsets(tp)
+      untilOffset = if (areOffsetsInLine(fromOffset, untilOffset)) untilOffset else fromOffset
       KafkaSourceRDDOffsetRange(tp, fromOffset, untilOffset, None)
     }.toArray
 
@@ -107,19 +110,34 @@ private[kafka010] class KafkaRelation(
     val rdd = new KafkaSourceRDD(
       sqlContext.sparkContext, executorKafkaParams, offsetRanges,
       pollTimeoutMs, failOnDataLoss, reuseKafkaConsumer = false).map { cr =>
-      InternalRow(
-        cr.key,
-        cr.value,
-        UTF8String.fromString(cr.topic),
-        cr.partition,
-        cr.offset,
-        DateTimeUtils.fromJavaTimestamp(new java.sql.Timestamp(cr.timestamp)),
-        cr.timestampType.id)
-    }
+        val columns = requiredColumns.map{KafkaRelation.columnToValueExtractor(_)(cr)}
+        InternalRow.fromSeq(columns)
+      }
+    val schema = StructType(requiredColumns.map{KafkaRelation.columnToSchema})
     sqlContext.internalCreateDataFrame(rdd.setName("kafka"), schema).rdd
   }
 
-  private def getPartitionOffsets(
+  private def areOffsetsInLine(fromOffset: Long, untilOffset: Long) = {
+    untilOffset > fromOffset || untilOffset < 0 || fromOffset < 0
+  }
+
+  private def getEndingPartitionOffsets(
+      kafkaReader: KafkaOffsetReader,
+      filters: Array[Filter]): Map[TopicPartition, Long] = {
+
+    val offsetsByLimit = getPartitionOffsetsByRangeLimit(kafkaReader, endingOffsets)
+    getEndingPartitionOffsetsByFilter(kafkaReader, offsetsByLimit, filters)
+  }
+
+  private def getStartingPartitionOffsets(
+      kafkaReader: KafkaOffsetReader,
+      filters: Array[Filter]): Map[TopicPartition, Long] = {
+
+    val offsetsByLimit = getPartitionOffsetsByRangeLimit(kafkaReader, startingOffsets)
+    getStartingPartitionOffsetsByFilter(kafkaReader, offsetsByLimit, filters)
+  }
+
+  private def getPartitionOffsetsByRangeLimit(
       kafkaReader: KafkaOffsetReader,
       kafkaOffsets: KafkaOffsetRangeLimit): Map[TopicPartition, Long] = {
     def validateTopicPartitions(partitions: Set[TopicPartition],
@@ -145,6 +163,90 @@ private[kafka010] class KafkaRelation(
     }
   }
 
+  private val TIMESTAMP_ATTR = "timestamp"
+
+  private def getStartingPartitionOffsetsByFilter(
+       kafkaReader: KafkaOffsetReader,
+       limitOffsets: Map[TopicPartition, Long],
+       filters: Array[Filter]): Map[TopicPartition, Long] = {
+
+    val timeOffsets: Map[TopicPartition, Long] = filters.flatMap {
+      case op: GreaterThan if op.attribute == TIMESTAMP_ATTR =>
+        val times = limitOffsets.map { case (tp, _) =>
+          tp -> (op.value.asInstanceOf[Timestamp].getTime + 1)}
+        kafkaReader.fetchOffsetsByTime(times)
+      case op: EqualTo if op.attribute == TIMESTAMP_ATTR =>
+        val times = limitOffsets.map { case (tp, _) =>
+          tp -> op.value.asInstanceOf[Timestamp].getTime}
+        kafkaReader.fetchOffsetsByTime(times)
+      case op: GreaterThanOrEqual if op.attribute == TIMESTAMP_ATTR =>
+        val times = limitOffsets.map { case (tp, _) =>
+          tp -> op.value.asInstanceOf[Timestamp].getTime}
+        kafkaReader.fetchOffsetsByTime(times)
+      case _ => None
+    }.toMap
+
+    limitOffsets.map {case (tp, offset) =>
+      tp -> math.max(offset, timeOffsets.getOrElse(tp, offset))
+    }
+  }
+
+  private def getEndingPartitionOffsetsByFilter(
+      kafkaReader: KafkaOffsetReader,
+      limitOffsets: Map[TopicPartition, Long],
+      filters: Array[Filter]): Map[TopicPartition, Long] = {
+
+    val timeOffsets: Map[TopicPartition, Long] = filters.flatMap {
+      case op: LessThan if op.attribute == TIMESTAMP_ATTR =>
+        val times = limitOffsets.map { case (tp, _) =>
+          tp -> (op.value.asInstanceOf[Timestamp].getTime - 1)}
+        kafkaReader.fetchOffsetsByTime(times)
+      case op: LessThanOrEqual if op.attribute == TIMESTAMP_ATTR =>
+        val times = limitOffsets.map { case (tp, _) =>
+          tp -> op.value.asInstanceOf[Timestamp].getTime}
+        kafkaReader.fetchOffsetsByTime(times)
+      case op: EqualTo if op.attribute == TIMESTAMP_ATTR =>
+        val times = limitOffsets.map { case (tp, _) =>
+          tp -> (op.value.asInstanceOf[Timestamp].getTime + 1)}
+        kafkaReader.fetchOffsetsByTime(times)
+      case _ => None
+    }.toMap
+
+    limitOffsets.map {case (tp, offset) =>
+      var newOffset = timeOffsets.getOrElse(tp, offset)
+      if (isLimitSpecified(offset)) {
+        newOffset = Math.min(offset, newOffset)
+      }
+      tp -> newOffset
+    }
+  }
+
+  private def isLimitSpecified(offset: Long): Boolean = {
+    offset >= 0
+  }
+
   override def toString: String =
     s"KafkaRelation(strategy=$strategy, start=$startingOffsets, end=$endingOffsets)"
+}
+
+object KafkaRelation {
+  private val columnToValueExtractor = Map[String, ConsumerRecord[Array[Byte], Array[Byte]] => Any](
+    "key" -> (cr => cr.key),
+    "value" -> (cr => cr.value),
+    "topic" -> (cr => UTF8String.fromString(cr.topic)),
+    "partition" -> (cr => cr.partition),
+    "offset" -> (cr => cr.offset),
+    "timestamp" -> (cr => DateTimeUtils.fromJavaTimestamp(new java.sql.Timestamp(cr.timestamp))),
+    "timestampType" -> (cr => cr.timestampType.id)
+  )
+
+  private val columnToSchema = Map[String, StructField](
+    "key" -> StructField("key", BinaryType),
+    "value" -> StructField("value", BinaryType),
+    "topic" -> StructField("topic", StringType),
+    "partition" -> StructField("partition", IntegerType),
+    "offset" -> StructField("offset", LongType),
+    "timestamp" -> StructField("timestamp", TimestampType),
+    "timestampType" -> StructField("timestampType", IntegerType)
+  )
 }
