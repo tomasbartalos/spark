@@ -468,18 +468,33 @@ case class FileSourceScanExec(
       currentSize = 0
     }
 
-    // Assign files to partitions using "Next Fit Decreasing"
-    splitFiles.foreach { file =>
-      if (currentSize + file.length > maxSplitBytes) {
+
+    fsRelation.options
+      .getOrElse("partitionByParquet", getPartitioningBySqlConf) match {
+      case x: String =>
+          partitions ++= splitFiles.groupBy(_.partitionValues).values
+          .zipWithIndex.map{ case (files: Array[PartitionedFile], index: Int)
+            => FilePartition(index, files.toSeq)
+          }
+      case _ =>
+        // Assign files to partitions using "Next Fit Decreasing"
+        splitFiles.foreach { file =>
+          if (currentSize + file.length > maxSplitBytes) {
+            closePartition()
+          }
+          // Add the given file to the current partition.
+          currentSize += file.length + openCostInBytes
+          currentFiles += file
+        }
         closePartition()
-      }
-      // Add the given file to the current partition.
-      currentSize += file.length + openCostInBytes
-      currentFiles += file
     }
-    closePartition()
+
 
     new FileScanRDD(fsRelation.sparkSession, readFile, partitions)
+  }
+
+  private def getPartitioningBySqlConf: String = {
+    sqlContext.sessionState.conf.getConfString("partitionByParquet", null)
   }
 
   private def getBlockLocations(file: FileStatus): Array[BlockLocation] = file match {
